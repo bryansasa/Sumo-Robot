@@ -181,7 +181,7 @@ v
 ## Tim Pengembang
 
 - Bryan Gabriel Izaac Sasabone
-- Muhammad Hafizh Odja
+- Mohammad Hafizh Odja
 - Arillian Dylan Nugraha
 
 ## Lisensi
