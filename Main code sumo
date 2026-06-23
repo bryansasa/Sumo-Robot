@@ -1,0 +1,1349 @@
+#include <Wire.h>
+#include <math.h>
+
+// ======================================================
+// ESP32 ROBOT SUMO - RTOS + STATE MACHINE + PID STEERING
+// AGGRESSIVE TARGET LOCK VERSION - SIDE PIVOT PATCH
+// ======================================================
+
+// ==========================================
+// MPU RAW I2C
+// ==========================================
+#define SDA_PIN 21
+#define SCL_PIN 5
+#define MPU_ADDR 0x68
+
+bool mpuOK = false;
+
+// ==========================================
+// IR SENSOR (BATAS ARENA)
+// ==========================================
+#define IR_KIRI_DEPAN      33
+#define IR_KIRI_BELAKANG   25
+#define IR_KANAN_BELAKANG  26
+#define IR_KANAN_DEPAN     32
+
+// Kalau sensor IR kamu kebalik, ubah HIGH jadi LOW
+#define GARIS_TERDETEKSI HIGH
+
+// ==========================================
+// ULTRASONIK
+// ==========================================
+#define TRIG_KIRI     22
+#define ECHO_KIRI     35
+
+#define TRIG_TENGAH   19
+#define ECHO_TENGAH   18
+
+#define TRIG_KANAN    23
+#define ECHO_KANAN    34
+
+// ==========================================
+// MOTOR DRIVER L298N
+// ==========================================
+#define ENA 27
+#define IN1 15
+#define IN2 14
+
+#define ENB 2
+#define IN3 13
+#define IN4 4
+
+// ======================================================
+// PWM ESP32 + PARAMETER PWM ROBOT
+// ======================================================
+// Catatan konfigurasi hasil kalibrasi:
+// - Maju lurus: motor kiri 255, motor kanan 210
+// - Mundur lurus: motor kiri 255, motor kanan 240
+// Jadi semua fungsi motor di bawah tidak lagi memakai analogWrite(),
+// tetapi memakai LEDC supaya PWM ESP32 stabil.
+
+#define CH_ENA 0
+#define CH_ENB 1
+#define PWM_FREQ 1000
+#define PWM_RES 8
+
+// Kalibrasi motor
+const int SPEED_KIRI_MAJU = 255;
+const int SPEED_KANAN_MAJU = 210;
+const int SPEED_KIRI_MUNDUR = 255;
+const int SPEED_KANAN_MUNDUR = 240;
+
+// SEARCH dibuat sedang saja (bukan ngebut) supaya robot tidak mudah
+// kebawa momentum sampai keluar garis tepi saat lagi muter cari lawan.
+// Begitu target terkunci (FRONT/CLOSE), kode di bawah langsung lompat
+// ke SPEED_SERANG/SPEED_DORONG (PWM maksimum) tanpa transisi pelan-pelan.
+const int SPEED_CARI = 170;
+
+// Saat ultrasonic samping mendeteksi target, robot jangan maju-PID dulu.
+// Robot harus pivot/muter menghadap target sampai sensor tengah ikut melihat.
+const int SPEED_LOCK_BELOK = 220;
+
+// TRACK maju-belok pakai PID
+const int SPEED_TRACK_BASE = 245;
+const int SPEED_TRACK_MIN = 150;
+const int SPEED_TRACK_MAX = 255;
+
+// ATTACK dan PUSH full PWM
+const int SPEED_SERANG = 255;
+const int SPEED_DORONG = 255;
+
+// Koreksi garis dan anti stuck
+const int SPEED_HINDAR = 255;
+
+// ==========================================
+// JARAK TARGET
+// ==========================================
+// Untuk arena diameter 1 meter, deteksi dibuat lebih jauh
+const int JARAK_SERANG_DEPAN_ON = 100;
+const int JARAK_SERANG_DEPAN_OFF = 120;
+
+const int JARAK_TARGET_SAMPING_ON = 90;
+const int JARAK_TARGET_SAMPING_OFF = 110;
+
+const int JARAK_SANGAT_DEKAT = 12;
+
+// Deadlock aktif kalau objek dekat terus
+const int JARAK_DEADLOCK = 17;
+
+// Kalau kiri-kanan beda tipis, pertahankan target sebelumnya
+const int TARGET_SIDE_MARGIN_CM = 10;
+
+// Timeout ultrasonic
+// Arena cuma diameter 1 meter, jadi jarak yang relevan maksimal ~130 cm.
+// Timeout dipersingkat dari 11000us (~187cm) jadi 8000us (~136cm).
+// Ini PENTING: pulseIn() akan menunggu PENUH durasi timeout setiap kali
+// tidak ada pantulan (yaitu setiap kali tidak ada lawan di depan sensor).
+// Saat SEARCH (lawan belum kelihatan), kondisi "tidak ada pantulan" ini
+// terjadi terus menerus di 3 sensor sekaligus, jadi timeout yang kepanjangan
+// bikin taskUltrasonic jadi lambat refresh-nya -> robot sudah berputar
+// lewat posisi lawan sebelum sensor sempat membaca data yang valid.
+const unsigned long TIMEOUT_ULTRASONIK = 8000;
+
+// ==========================================
+// TARGET LOCK
+// ==========================================
+const unsigned long TARGET_LOCK_MS = 250;
+const unsigned long TARGET_LOST_MS = 350;
+
+// Search satu arah supaya tidak kelihatan ragu
+const unsigned long SEARCH_SWEEP_MS = 1800;
+
+// Search sekarang "putar - lirik" bukan putar nonstop.
+// Putar sebentar, lalu diam sejenak supaya 3 sensor ultrasonik
+// sempat mendapat pembacaan yang valid sebelum robot berputar lagi.
+// Tanpa ini, robot bisa sudah lewat posisi lawan sebelum data
+// jarak yang baru sempat masuk.
+const unsigned long SEARCH_SPIN_MS = 160;
+const unsigned long SEARCH_GLANCE_MS = 70;
+
+// ==========================================
+// PID STEERING TARGET
+// ==========================================
+// PID ini untuk arah hadap target, bukan PID RPM
+float KpTarget = 5.5;
+float KiTarget = 0.0;
+float KdTarget = 1.8;
+
+float pidErrorLast = 0;
+float pidIntegral = 0;
+unsigned long pidLastMs = 0;
+
+const int PID_CORRECTION_LIMIT = 130;
+
+// ==========================================
+// DURASI MANUVER GARIS
+// ==========================================
+const unsigned long GARIS_STOP_MS = 20;
+const unsigned long GARIS_MUNDUR_MS = 420;
+const unsigned long GARIS_MAJU_MS = 360;
+const unsigned long GARIS_BELOK_DEPAN_MS = 380;
+const unsigned long GARIS_BELOK_BELAKANG_MS = 330;
+const unsigned long GARIS_SELESAI_MS = 60;
+
+// ==========================================
+// DURASI MANUVER ANTI DEADLOCK
+// ==========================================
+const unsigned long ANTISTUCK_STOP_MS = 60;
+const unsigned long ANTISTUCK_MUNDUR_MS = 650;
+const unsigned long ANTISTUCK_BELOK_MS = 620;
+const unsigned long ANTISTUCK_SELESAI_MS = 80;
+
+// Deadlock time
+// Sebelumnya 1000ms (1 detik), sekarang diset 7000ms (7 detik) sesuai
+// permintaan: robot menunggu lebih lama sebelum dianggap "mandek" dan
+// memicu manuver mundur + belok. Selama menunggu, robot tetap PUSH
+// full PWM seperti biasa; deteksi garis tepi (lihat catatan di taskRobot)
+// tetap punya prioritas paling tinggi, jadi walau lagi nge-push lawan ke
+// pinggir, begitu sensor depan kena garis, robot langsung berhenti dan
+// masuk AVOID_LINE duluan sebelum sempat keluar lapangan.
+const unsigned long DEADLOCK_MS = 7000;
+
+// ==========================================
+// RTOS INTERVAL
+// ==========================================
+const int IR_TASK_INTERVAL_MS = 2;
+const int ROBOT_TASK_INTERVAL_MS = 5;
+const int ULTRA_TASK_INTERVAL_MS = 45;
+const int MPU_TASK_INTERVAL_MS = 20;
+
+// ==========================================
+// STATE MACHINE
+// ==========================================
+enum RobotState {
+  STATE_SEARCH,
+  STATE_TRACK_LEFT,
+  STATE_TRACK_RIGHT,
+  STATE_ATTACK,
+  STATE_PUSH,
+  STATE_AVOID_LINE,
+  STATE_ANTI_STUCK
+};
+
+enum TargetDir {
+  TARGET_NONE,
+  TARGET_FRONT,
+  TARGET_LEFT,
+  TARGET_RIGHT,
+  TARGET_CLOSE
+};
+
+enum LineCode {
+  LINE_NONE,
+  LINE_FRONT_LEFT,
+  LINE_FRONT_RIGHT,
+  LINE_FRONT_BOTH,
+  LINE_BACK_LEFT,
+  LINE_BACK_RIGHT,
+  LINE_BACK_BOTH
+};
+
+// ==========================================
+// GLOBAL DATA SENSOR
+// ==========================================
+volatile long gJarakKiri = 999;
+volatile long gJarakTengah = 999;
+volatile long gJarakKanan = 999;
+
+volatile float gAccelX = 0.0;
+
+volatile bool gLineDetected = false;
+volatile uint8_t gLineCode = LINE_NONE;
+
+volatile RobotState robotState = STATE_SEARCH;
+
+// ==========================================
+// INTERNAL STATE VARIABLE
+// ==========================================
+unsigned long stateEnterMs = 0;
+unsigned long stateStepStartMs = 0;
+
+uint8_t avoidStep = 0;
+uint8_t avoidLineSnapshot = LINE_NONE;
+
+uint8_t antiStuckStep = 0;
+bool antiStuckBelokKanan = true;
+
+unsigned long deadlockStartMs = 0;
+
+TargetDir lastTargetDir = TARGET_NONE;
+TargetDir lockedTargetDir = TARGET_NONE;
+
+unsigned long lastTargetSeenMs = 0;
+unsigned long targetLockStartMs = 0;
+
+unsigned long lastDebugMs = 0;
+
+bool searchTurnRight = true;
+unsigned long searchSwitchMs = 0;
+
+// ======================================================
+// MPU RAW FUNCTION
+// ======================================================
+byte readMPURegister(byte reg) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(MPU_ADDR, 1);
+
+  if (Wire.available()) {
+    return Wire.read();
+  }
+
+  return 0xFF;
+}
+
+void writeMPU(byte reg, byte value) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+int16_t readMPU16(byte reg) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(MPU_ADDR, 2);
+
+  if (Wire.available() < 2) {
+    return 0;
+  }
+
+  int16_t value = Wire.read() << 8 | Wire.read();
+  return value;
+}
+
+float getAccelX() {
+  int16_t axRaw = readMPU16(0x3B);
+
+  // Range accel diset +/- 8G, scale factor = 4096 LSB/g
+  float ax_g = axRaw / 4096.0;
+
+  // Konversi ke m/s^2
+  float ax = ax_g * 9.81;
+
+  return ax;
+}
+
+void initMPU() {
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(500);
+
+  byte whoami = readMPURegister(0x75);
+
+  Serial.print("WHO_AM_I MPU: 0x");
+  Serial.println(whoami, HEX);
+
+  if (whoami == 0x68 || whoami == 0x70 || whoami == 0x71) {
+    mpuOK = true;
+
+    // Wake up MPU
+    writeMPU(0x6B, 0x00);
+    delay(100);
+
+    // Accelerometer range +/- 8G
+    writeMPU(0x1C, 0x10);
+
+    // Gyro range +/- 500 deg/s
+    writeMPU(0x1B, 0x08);
+
+    Serial.println("MPU RAW siap dibaca.");
+  } else {
+    mpuOK = false;
+    Serial.println("MPU tidak valid, robot tetap jalan tanpa MPU.");
+  }
+}
+
+// ======================================================
+// MOTOR CONTROL
+// ======================================================
+int scalePWM(int speed, int maxKalibrasi) {
+  speed = constrain(speed, 0, 255);
+  maxKalibrasi = constrain(maxKalibrasi, 0, 255);
+
+  return (speed * maxKalibrasi) / 255;
+}
+
+void setPWMKiri(int pwm) {
+  pwm = constrain(pwm, 0, 255);
+  ledcWrite(CH_ENA, pwm);
+}
+
+void setPWMKanan(int pwm) {
+  pwm = constrain(pwm, 0, 255);
+  ledcWrite(CH_ENB, pwm);
+}
+
+void motorMaju(int speed) {
+  int pwmKiri = scalePWM(speed, SPEED_KIRI_MAJU);
+  int pwmKanan = scalePWM(speed, SPEED_KANAN_MAJU);
+
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  setPWMKiri(pwmKiri);
+  setPWMKanan(pwmKanan);
+}
+
+void motorMundur(int speed) {
+  int pwmKiri = scalePWM(speed, SPEED_KIRI_MUNDUR);
+  int pwmKanan = scalePWM(speed, SPEED_KANAN_MUNDUR);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  setPWMKiri(pwmKiri);
+  setPWMKanan(pwmKanan);
+}
+
+void motorKiri(int speed) {
+  // Belok kiri: motor kiri mundur, motor kanan maju
+  int pwmKiri = scalePWM(speed, SPEED_KIRI_MUNDUR);
+  int pwmKanan = scalePWM(speed, SPEED_KANAN_MAJU);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  setPWMKiri(pwmKiri);
+  setPWMKanan(pwmKanan);
+}
+
+void motorKanan(int speed) {
+  // Belok kanan: motor kiri maju, motor kanan mundur
+  int pwmKiri = scalePWM(speed, SPEED_KIRI_MAJU);
+  int pwmKanan = scalePWM(speed, SPEED_KANAN_MUNDUR);
+
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  setPWMKiri(pwmKiri);
+  setPWMKanan(pwmKanan);
+}
+
+// Motor maju dengan speed kiri-kanan beda.
+// ENA diasumsikan motor kiri, ENB diasumsikan motor kanan.
+// Speed dari PID tetap dikalibrasi agar robot tidak lari ke kiri.
+void motorMajuLR(int speedKiri, int speedKanan) {
+  int pwmKiri = scalePWM(speedKiri, SPEED_KIRI_MAJU);
+  int pwmKanan = scalePWM(speedKanan, SPEED_KANAN_MAJU);
+
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  setPWMKiri(pwmKiri);
+  setPWMKanan(pwmKanan);
+}
+
+void motorBerhenti() {
+  setPWMKiri(0);
+  setPWMKanan(0);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// ======================================================
+// STATE UTILITY
+// ======================================================
+const char* stateName(RobotState s) {
+  switch (s) {
+    case STATE_SEARCH:      return "SEARCH";
+    case STATE_TRACK_LEFT:  return "TRACK_LEFT";
+    case STATE_TRACK_RIGHT: return "TRACK_RIGHT";
+    case STATE_ATTACK:      return "ATTACK";
+    case STATE_PUSH:        return "PUSH";
+    case STATE_AVOID_LINE:  return "AVOID_LINE";
+    case STATE_ANTI_STUCK:  return "ANTI_STUCK";
+    default:                return "UNKNOWN";
+  }
+}
+
+const char* targetName(TargetDir t) {
+  switch (t) {
+    case TARGET_NONE:  return "NONE";
+    case TARGET_FRONT: return "FRONT";
+    case TARGET_LEFT:  return "LEFT";
+    case TARGET_RIGHT: return "RIGHT";
+    case TARGET_CLOSE: return "CLOSE";
+    default:           return "UNKNOWN";
+  }
+}
+
+void setState(RobotState newState) {
+  RobotState oldState = robotState;
+
+  if (oldState != newState) {
+    robotState = newState;
+    stateEnterMs = millis();
+
+    Serial.print("STATE: ");
+    Serial.print(stateName(oldState));
+    Serial.print(" -> ");
+    Serial.println(stateName(newState));
+  }
+}
+
+// ======================================================
+// IR LINE READING
+// ======================================================
+uint8_t readLineCodeNow() {
+  bool kiriDepan = digitalRead(IR_KIRI_DEPAN) == GARIS_TERDETEKSI;
+  bool kananDepan = digitalRead(IR_KANAN_DEPAN) == GARIS_TERDETEKSI;
+  bool kiriBelakang = digitalRead(IR_KIRI_BELAKANG) == GARIS_TERDETEKSI;
+  bool kananBelakang = digitalRead(IR_KANAN_BELAKANG) == GARIS_TERDETEKSI;
+
+  // Prioritas depan dulu, karena paling berbahaya saat robot menyerang
+  if (kiriDepan && kananDepan) {
+    return LINE_FRONT_BOTH;
+  }
+
+  if (kiriDepan) {
+    return LINE_FRONT_LEFT;
+  }
+
+  if (kananDepan) {
+    return LINE_FRONT_RIGHT;
+  }
+
+  if (kiriBelakang && kananBelakang) {
+    return LINE_BACK_BOTH;
+  }
+
+  if (kiriBelakang) {
+    return LINE_BACK_LEFT;
+  }
+
+  if (kananBelakang) {
+    return LINE_BACK_RIGHT;
+  }
+
+  return LINE_NONE;
+}
+
+bool lineIsFront(uint8_t code) {
+  return code == LINE_FRONT_LEFT ||
+         code == LINE_FRONT_RIGHT ||
+         code == LINE_FRONT_BOTH;
+}
+
+bool lineIsBack(uint8_t code) {
+  return code == LINE_BACK_LEFT ||
+         code == LINE_BACK_RIGHT ||
+         code == LINE_BACK_BOTH;
+}
+
+bool lineTurnRight(uint8_t code) {
+  if (code == LINE_FRONT_LEFT) return true;
+  if (code == LINE_FRONT_RIGHT) return false;
+  if (code == LINE_FRONT_BOTH) return true;
+
+  if (code == LINE_BACK_LEFT) return true;
+  if (code == LINE_BACK_RIGHT) return false;
+  if (code == LINE_BACK_BOTH) return false;
+
+  return true;
+}
+
+// ======================================================
+// ULTRASONIC
+// ======================================================
+long readDistanceRaw(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, TIMEOUT_ULTRASONIK);
+
+  if (duration == 0) {
+    return 999;
+  }
+
+  long distance = duration * 0.034 / 2;
+
+  if (distance <= 0 || distance > 200) {
+    return 999;
+  }
+
+  return distance;
+}
+
+bool jarakValid(long jarak) {
+  return jarak > 0 && jarak < 999;
+}
+
+// ======================================================
+// TARGET DECISION - AGGRESSIVE
+// ======================================================
+TargetDir readTargetRawSmart(long tengah, long kiri, long kanan) {
+  bool tengahValid = jarakValid(tengah);
+  bool kiriValid = jarakValid(kiri);
+  bool kananValid = jarakValid(kanan);
+
+  // 1. Kalau depan sangat dekat, langsung dorong
+  if (tengahValid && tengah <= JARAK_SANGAT_DEKAT) {
+    return TARGET_CLOSE;
+  }
+
+  // 2. Depan adalah prioritas utama.
+  // Kalau sensor tengah melihat lawan, langsung serang.
+  bool frontOn = tengahValid && tengah <= JARAK_SERANG_DEPAN_ON;
+
+  bool sedangAttack = robotState == STATE_ATTACK ||
+                      robotState == STATE_PUSH ||
+                      lockedTargetDir == TARGET_FRONT ||
+                      lockedTargetDir == TARGET_CLOSE;
+
+  bool frontHold = sedangAttack &&
+                   tengahValid &&
+                   tengah <= JARAK_SERANG_DEPAN_OFF;
+
+  if (frontOn || frontHold) {
+    return TARGET_FRONT;
+  }
+
+  // 3. Sensor samping dibuat lebih mudah mengunci target.
+  bool kiriOn = false;
+  bool kananOn = false;
+
+  if (kiriValid) {
+    if (lockedTargetDir == TARGET_LEFT) {
+      kiriOn = kiri <= JARAK_TARGET_SAMPING_OFF;
+    } else {
+      kiriOn = kiri <= JARAK_TARGET_SAMPING_ON;
+    }
+  }
+
+  if (kananValid) {
+    if (lockedTargetDir == TARGET_RIGHT) {
+      kananOn = kanan <= JARAK_TARGET_SAMPING_OFF;
+    } else {
+      kananOn = kanan <= JARAK_TARGET_SAMPING_ON;
+    }
+  }
+
+  // 4. Kalau sedang lock kiri dan kiri masih masuk batas OFF,
+  // jangan gampang pindah kanan.
+  if (lockedTargetDir == TARGET_LEFT && kiriOn) {
+    if (!kananOn) {
+      return TARGET_LEFT;
+    }
+
+    if (abs(kiri - kanan) <= TARGET_SIDE_MARGIN_CM) {
+      return TARGET_LEFT;
+    }
+  }
+
+  // 5. Kalau sedang lock kanan dan kanan masih masuk batas OFF,
+  // jangan gampang pindah kiri.
+  if (lockedTargetDir == TARGET_RIGHT && kananOn) {
+    if (!kiriOn) {
+      return TARGET_RIGHT;
+    }
+
+    if (abs(kiri - kanan) <= TARGET_SIDE_MARGIN_CM) {
+      return TARGET_RIGHT;
+    }
+  }
+
+  // 6. Kalau kiri dan kanan sama-sama melihat,
+  // pilih yang lebih dekat.
+  if (kiriOn && kananOn) {
+    if (kiri <= kanan) {
+      return TARGET_LEFT;
+    } else {
+      return TARGET_RIGHT;
+    }
+  }
+
+  if (kiriOn) {
+    return TARGET_LEFT;
+  }
+
+  if (kananOn) {
+    return TARGET_RIGHT;
+  }
+
+  return TARGET_NONE;
+}
+
+TargetDir getDecisionTarget(long tengah, long kiri, long kanan) {
+  unsigned long now = millis();
+
+  TargetDir rawTarget = readTargetRawSmart(tengah, kiri, kanan);
+
+  if (rawTarget != TARGET_NONE) {
+    lastTargetSeenMs = now;
+    lastTargetDir = rawTarget;
+
+    // FRONT dan CLOSE boleh override kapan saja
+    if (rawTarget == TARGET_FRONT || rawTarget == TARGET_CLOSE) {
+      lockedTargetDir = rawTarget;
+      targetLockStartMs = now;
+      return rawTarget;
+    }
+
+    // Kalau belum ada lock, ambil target baru
+    if (lockedTargetDir == TARGET_NONE) {
+      lockedTargetDir = rawTarget;
+      targetLockStartMs = now;
+      return rawTarget;
+    }
+
+    // Kalau target sama dengan lock, lanjut
+    if (rawTarget == lockedTargetDir) {
+      targetLockStartMs = now;
+      return lockedTargetDir;
+    }
+
+    // Kalau masih masa lock, jangan pindah kiri-kanan dulu
+    if (now - targetLockStartMs < TARGET_LOCK_MS) {
+      return lockedTargetDir;
+    }
+
+    // Lock sudah lewat, boleh pindah target
+    lockedTargetDir = rawTarget;
+    targetLockStartMs = now;
+    return rawTarget;
+  }
+
+  // Kalau target hilang sebentar, tetap pakai target terakhir
+  if (lastTargetDir != TARGET_NONE && now - lastTargetSeenMs <= TARGET_LOST_MS) {
+    return lastTargetDir;
+  }
+
+  lockedTargetDir = TARGET_NONE;
+  lastTargetDir = TARGET_NONE;
+
+  return TARGET_NONE;
+}
+
+// ======================================================
+// PID TARGET STEERING
+// ======================================================
+void resetTargetPID() {
+  pidErrorLast = 0;
+  pidIntegral = 0;
+  pidLastMs = millis();
+}
+
+float getTargetError(TargetDir target, long tengah, long kiri, long kanan) {
+  bool kiriValid = jarakValid(kiri);
+  bool kananValid = jarakValid(kanan);
+
+  // Error negatif = target di kiri
+  // Error positif = target di kanan
+
+  if (target == TARGET_LEFT) {
+    if (kiriValid) {
+      return -1.0 * (JARAK_TARGET_SAMPING_OFF - kiri);
+    }
+
+    return -25.0;
+  }
+
+  if (target == TARGET_RIGHT) {
+    if (kananValid) {
+      return 1.0 * (JARAK_TARGET_SAMPING_OFF - kanan);
+    }
+
+    return 25.0;
+  }
+
+  if (target == TARGET_FRONT || target == TARGET_CLOSE) {
+    // Kalau dua sensor samping valid, bantu koreksi arah
+    // kiri lebih dekat dari kanan = target agak kiri = error negatif
+    if (kiriValid && kananValid) {
+      return kiri - kanan;
+    }
+
+    if (kiriValid && !kananValid) {
+      return -8.0;
+    }
+
+    if (!kiriValid && kananValid) {
+      return 8.0;
+    }
+
+    return 0.0;
+  }
+
+  return 0.0;
+}
+
+int computePIDCorrection(float error) {
+  unsigned long now = millis();
+
+  float dt = (now - pidLastMs) / 1000.0;
+
+  if (dt <= 0.001) {
+    dt = 0.001;
+  }
+
+  pidIntegral += error * dt;
+  pidIntegral = constrain(pidIntegral, -40, 40);
+
+  float derivative = (error - pidErrorLast) / dt;
+
+  float output = (KpTarget * error) +
+                 (KiTarget * pidIntegral) +
+                 (KdTarget * derivative);
+
+  pidErrorLast = error;
+  pidLastMs = now;
+
+  output = constrain(output, -PID_CORRECTION_LIMIT, PID_CORRECTION_LIMIT);
+
+  return (int)output;
+}
+
+void motorTrackPID(TargetDir target, long tengah, long kiri, long kanan) {
+  float error = getTargetError(target, tengah, kiri, kanan);
+  int correction = computePIDCorrection(error);
+
+  int speedKiri = SPEED_TRACK_BASE + correction;
+  int speedKanan = SPEED_TRACK_BASE - correction;
+
+  speedKiri = constrain(speedKiri, SPEED_TRACK_MIN, SPEED_TRACK_MAX);
+  speedKanan = constrain(speedKanan, SPEED_TRACK_MIN, SPEED_TRACK_MAX);
+
+  motorMajuLR(speedKiri, speedKanan);
+}
+
+// ======================================================
+// AVOID LINE STATE
+// ======================================================
+void beginAvoidLine() {
+  avoidLineSnapshot = gLineCode;
+
+  if (avoidLineSnapshot == LINE_NONE) {
+    avoidLineSnapshot = readLineCodeNow();
+  }
+
+  avoidStep = 0;
+  stateStepStartMs = millis();
+
+  deadlockStartMs = 0;
+
+  // Reset target supaya setelah koreksi garis, robot cari ulang
+  lockedTargetDir = TARGET_NONE;
+  lastTargetDir = TARGET_NONE;
+  resetTargetPID();
+
+  motorBerhenti();
+  setState(STATE_AVOID_LINE);
+
+  Serial.print("LINE CODE: ");
+  Serial.println(avoidLineSnapshot);
+}
+
+void processAvoidLine() {
+  unsigned long now = millis();
+
+  switch (avoidStep) {
+    case 0:
+      motorBerhenti();
+
+      if (now - stateStepStartMs >= GARIS_STOP_MS) {
+        avoidStep = 1;
+        stateStepStartMs = now;
+      }
+      break;
+
+    case 1:
+      if (lineIsFront(avoidLineSnapshot)) {
+        motorMundur(SPEED_HINDAR);
+
+        if (now - stateStepStartMs >= GARIS_MUNDUR_MS) {
+          avoidStep = 2;
+          stateStepStartMs = now;
+        }
+      } else if (lineIsBack(avoidLineSnapshot)) {
+        motorMaju(SPEED_HINDAR);
+
+        if (now - stateStepStartMs >= GARIS_MAJU_MS) {
+          avoidStep = 2;
+          stateStepStartMs = now;
+        }
+      } else {
+        avoidStep = 3;
+        stateStepStartMs = now;
+      }
+      break;
+
+    case 2:
+      if (lineTurnRight(avoidLineSnapshot)) {
+        motorKanan(SPEED_HINDAR);
+      } else {
+        motorKiri(SPEED_HINDAR);
+      }
+
+      if (lineIsFront(avoidLineSnapshot)) {
+        if (now - stateStepStartMs >= GARIS_BELOK_DEPAN_MS) {
+          avoidStep = 3;
+          stateStepStartMs = now;
+        }
+      } else {
+        if (now - stateStepStartMs >= GARIS_BELOK_BELAKANG_MS) {
+          avoidStep = 3;
+          stateStepStartMs = now;
+        }
+      }
+      break;
+
+    case 3:
+      motorBerhenti();
+
+      if (now - stateStepStartMs >= GARIS_SELESAI_MS) {
+        avoidStep = 0;
+        setState(STATE_SEARCH);
+      }
+      break;
+  }
+}
+
+// ======================================================
+// ANTI STUCK STATE
+// ======================================================
+void beginAntiStuck() {
+  antiStuckStep = 0;
+  stateStepStartMs = millis();
+
+  // Reset target supaya setelah anti-stuck, robot cari ulang
+  lockedTargetDir = TARGET_NONE;
+  lastTargetDir = TARGET_NONE;
+  resetTargetPID();
+
+  motorBerhenti();
+  setState(STATE_ANTI_STUCK);
+
+  Serial.println("ANTI STUCK: mulai mundur dan belok jauh");
+}
+
+void processAntiStuck() {
+  unsigned long now = millis();
+
+  switch (antiStuckStep) {
+    case 0:
+      motorBerhenti();
+
+      if (now - stateStepStartMs >= ANTISTUCK_STOP_MS) {
+        antiStuckStep = 1;
+        stateStepStartMs = now;
+      }
+      break;
+
+    case 1:
+      motorMundur(SPEED_HINDAR);
+
+      if (now - stateStepStartMs >= ANTISTUCK_MUNDUR_MS) {
+        antiStuckStep = 2;
+        stateStepStartMs = now;
+      }
+      break;
+
+    case 2:
+      if (antiStuckBelokKanan) {
+        motorKanan(SPEED_HINDAR);
+      } else {
+        motorKiri(SPEED_HINDAR);
+      }
+
+      if (now - stateStepStartMs >= ANTISTUCK_BELOK_MS) {
+        antiStuckStep = 3;
+        stateStepStartMs = now;
+      }
+      break;
+
+    case 3:
+      motorBerhenti();
+
+      if (now - stateStepStartMs >= ANTISTUCK_SELESAI_MS) {
+        antiStuckBelokKanan = !antiStuckBelokKanan;
+        deadlockStartMs = 0;
+        antiStuckStep = 0;
+        setState(STATE_SEARCH);
+      }
+      break;
+  }
+}
+
+// ======================================================
+// DEADLOCK CHECK
+// ======================================================
+bool checkDeadlock(float accelX, long jarakTengah) {
+  unsigned long now = millis();
+
+  bool targetDekat = jarakTengah <= JARAK_DEADLOCK;
+
+  bool indikasiTidakBergerak = false;
+
+  if (mpuOK) {
+    indikasiTidakBergerak = fabs(accelX) < 1.2;
+  } else {
+    indikasiTidakBergerak = true;
+  }
+
+  if (targetDekat && indikasiTidakBergerak) {
+    if (deadlockStartMs == 0) {
+      deadlockStartMs = now;
+    }
+
+    if (now - deadlockStartMs >= DEADLOCK_MS) {
+      beginAntiStuck();
+      return true;
+    }
+  } else {
+    deadlockStartMs = 0;
+  }
+
+  return false;
+}
+
+// ======================================================
+// SEARCH MOTION
+// ======================================================
+void doSearchMotion() {
+  // SEARCH sekarang "putar - lirik": putar sebentar, lalu diam sejenak.
+  // Saat diam, robot tidak menambah blur pada pembacaan ultrasonik,
+  // jadi begitu lawan masuk jarak deteksi, nilai gJarakTengah/Kiri/Kanan
+  // yang terbaca benar-benar valid dan langsung dipakai pada loop
+  // berikutnya untuk pindah ke ATTACK/PUSH.
+  unsigned long now = millis();
+  unsigned long elapsed = now - searchSwitchMs;
+
+  if (elapsed < SEARCH_SPIN_MS) {
+    motorKanan(SPEED_CARI);
+  } else if (elapsed < SEARCH_SPIN_MS + SEARCH_GLANCE_MS) {
+    motorBerhenti();
+  } else {
+    searchSwitchMs = now;
+    motorKanan(SPEED_CARI);
+  }
+}
+
+// ======================================================
+// DEBUG
+// ======================================================
+void printDebugThrottled(TargetDir targetNow) {
+  unsigned long now = millis();
+
+  if (now - lastDebugMs < 250) {
+    return;
+  }
+
+  lastDebugMs = now;
+
+  Serial.print("STATE=");
+  Serial.print(stateName(robotState));
+
+  Serial.print(" | Target=");
+  Serial.print(targetName(targetNow));
+
+  Serial.print(" | Lock=");
+  Serial.print(targetName(lockedTargetDir));
+
+  Serial.print(" | Kiri=");
+  Serial.print(gJarakKiri);
+
+  Serial.print(" | Tengah=");
+  Serial.print(gJarakTengah);
+
+  Serial.print(" | Kanan=");
+  Serial.print(gJarakKanan);
+
+  Serial.print(" | AccelX=");
+  Serial.print(gAccelX);
+
+  Serial.print(" | Line=");
+  Serial.print(gLineDetected);
+
+  Serial.print(" | Code=");
+  Serial.println(gLineCode);
+}
+
+// ======================================================
+// RTOS TASK: IR SENSOR
+// Prioritas tinggi supaya garis cepat kebaca
+// ======================================================
+void taskIR(void *parameter) {
+  while (true) {
+    uint8_t code = readLineCodeNow();
+
+    gLineCode = code;
+    gLineDetected = code != LINE_NONE;
+
+    vTaskDelay(pdMS_TO_TICKS(IR_TASK_INTERVAL_MS));
+  }
+}
+
+// ======================================================
+// RTOS TASK: ULTRASONIC
+// Pembacaan ultrasonic dipisah supaya pulseIn tidak menahan logika robot
+// ======================================================
+void taskUltrasonic(void *parameter) {
+  while (true) {
+    long tengah = readDistanceRaw(TRIG_TENGAH, ECHO_TENGAH);
+    vTaskDelay(pdMS_TO_TICKS(6));
+
+    long kiri = readDistanceRaw(TRIG_KIRI, ECHO_KIRI);
+    vTaskDelay(pdMS_TO_TICKS(6));
+
+    long kanan = readDistanceRaw(TRIG_KANAN, ECHO_KANAN);
+
+    gJarakTengah = tengah;
+    gJarakKiri = kiri;
+    gJarakKanan = kanan;
+
+    vTaskDelay(pdMS_TO_TICKS(ULTRA_TASK_INTERVAL_MS));
+  }
+}
+
+// ======================================================
+// RTOS TASK: MPU
+// ======================================================
+void taskMPU(void *parameter) {
+  while (true) {
+    if (mpuOK) {
+      gAccelX = getAccelX();
+    } else {
+      gAccelX = 0.0;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(MPU_TASK_INTERVAL_MS));
+  }
+}
+
+// ======================================================
+// RTOS TASK: ROBOT STATE MACHINE
+// Ini satu-satunya task utama yang mengontrol motor
+// ======================================================
+void taskRobot(void *parameter) {
+  while (true) {
+    TargetDir targetForDebug = TARGET_NONE;
+
+    // PRIORITAS PALING TINGGI:
+    // Kalau garis terdeteksi, langsung masuk state koreksi garis.
+    // Ini berlaku untuk SEMUA state termasuk STATE_ANTI_STUCK -> jadi
+    // walaupun robot sedang mundur/belok full PWM buat lepas dari deadlock,
+    // begitu salah satu sensor IR kena garis tepi, baris ini langsung
+    // memotong dan memaksa beginAvoidLine() dipanggil pada iterasi yang
+    // sama, sebelum processAntiStuck() sempat jalan lagi. Robot tidak
+    // akan terus mundur/belok melewati garis tepi.
+    if (gLineDetected && robotState != STATE_AVOID_LINE) {
+      beginAvoidLine();
+    }
+
+    if (robotState == STATE_AVOID_LINE) {
+      processAvoidLine();
+      printDebugThrottled(targetForDebug);
+      vTaskDelay(pdMS_TO_TICKS(ROBOT_TASK_INTERVAL_MS));
+      continue;
+    }
+
+    // Kalau sedang anti stuck, garis tetap bisa override karena dicek di atas.
+    if (robotState == STATE_ANTI_STUCK) {
+      processAntiStuck();
+      printDebugThrottled(targetForDebug);
+      vTaskDelay(pdMS_TO_TICKS(ROBOT_TASK_INTERVAL_MS));
+      continue;
+    }
+
+    long jarakTengah = gJarakTengah;
+    long jarakKiri = gJarakKiri;
+    long jarakKanan = gJarakKanan;
+    float accelX = gAccelX;
+
+    TargetDir target = getDecisionTarget(jarakTengah, jarakKiri, jarakKanan);
+    targetForDebug = target;
+
+    // ======================================
+    // STATE DECISION
+    // ======================================
+    if (target == TARGET_CLOSE) {
+      setState(STATE_PUSH);
+
+      resetTargetPID();
+
+      // PUSH full PWM
+      motorMaju(SPEED_DORONG);
+
+      if (checkDeadlock(accelX, jarakTengah)) {
+        printDebugThrottled(targetForDebug);
+        vTaskDelay(pdMS_TO_TICKS(ROBOT_TASK_INTERVAL_MS));
+        continue;
+      }
+    }
+
+    else if (target == TARGET_FRONT) {
+      setState(STATE_ATTACK);
+
+      resetTargetPID();
+
+      // ATTACK full PWM
+      motorMaju(SPEED_SERANG);
+
+      if (checkDeadlock(accelX, jarakTengah)) {
+        printDebugThrottled(targetForDebug);
+        vTaskDelay(pdMS_TO_TICKS(ROBOT_TASK_INTERVAL_MS));
+        continue;
+      }
+    }
+
+    else if (target == TARGET_LEFT) {
+      if (robotState != STATE_TRACK_LEFT) {
+        resetTargetPID();
+      }
+
+      setState(STATE_TRACK_LEFT);
+
+      deadlockStartMs = 0;
+
+      // PATCH TRANSISI SEARCH -> ATTACK:
+      // Kalau target baru terlihat di sensor kiri, jangan maju dulu.
+      // Pivot ke kiri sampai sensor tengah melihat target, lalu state akan masuk ATTACK.
+      motorKiri(SPEED_LOCK_BELOK);
+    }
+
+    else if (target == TARGET_RIGHT) {
+      if (robotState != STATE_TRACK_RIGHT) {
+        resetTargetPID();
+      }
+
+      setState(STATE_TRACK_RIGHT);
+
+      deadlockStartMs = 0;
+
+      // PATCH TRANSISI SEARCH -> ATTACK:
+      // Kalau target baru terlihat di sensor kanan, pivot ke kanan dulu.
+      // Begitu sensor tengah melihat target, robot langsung masuk ATTACK.
+      motorKanan(SPEED_LOCK_BELOK);
+    }
+
+    else {
+      if (robotState != STATE_SEARCH) {
+        resetTargetPID();
+        searchSwitchMs = millis();
+      }
+
+      setState(STATE_SEARCH);
+
+      deadlockStartMs = 0;
+
+      // SEARCH agresif: putar - lirik
+      doSearchMotion();
+    }
+
+    printDebugThrottled(targetForDebug);
+
+    vTaskDelay(pdMS_TO_TICKS(ROBOT_TASK_INTERVAL_MS));
+  }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("Robot booting RTOS + Aggressive Target Lock...");
+
+  pinMode(IR_KIRI_DEPAN, INPUT);
+  pinMode(IR_KIRI_BELAKANG, INPUT);
+  pinMode(IR_KANAN_BELAKANG, INPUT);
+  pinMode(IR_KANAN_DEPAN, INPUT);
+
+  pinMode(TRIG_KIRI, OUTPUT);
+  pinMode(ECHO_KIRI, INPUT);
+
+  pinMode(TRIG_TENGAH, OUTPUT);
+  pinMode(ECHO_TENGAH, INPUT);
+
+  pinMode(TRIG_KANAN, OUTPUT);
+  pinMode(ECHO_KANAN, INPUT);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  // PWM ESP32 untuk L298N
+  ledcSetup(CH_ENA, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_ENB, PWM_FREQ, PWM_RES);
+
+  ledcAttachPin(ENA, CH_ENA);
+  ledcAttachPin(ENB, CH_ENB);
+
+  motorBerhenti();
+
+  initMPU();
+
+  stateEnterMs = millis();
+  stateStepStartMs = millis();
+  searchSwitchMs = millis();
+  pidLastMs = millis();
+
+  Serial.println("Membuat RTOS task...");
+
+  // Core 1: IR dan robot control supaya respons cepat
+  xTaskCreatePinnedToCore(
+    taskIR,
+    "IR Task",
+    2048,
+    NULL,
+    5,
+    NULL,
+    1
+  );
+
+  xTaskCreatePinnedToCore(
+    taskRobot,
+    "Robot State Task",
+    4096,
+    NULL,
+    4,
+    NULL,
+    1
+  );
+
+  // Core 0: sensor berat / blocking
+  xTaskCreatePinnedToCore(
+    taskUltrasonic,
+    "Ultrasonic Task",
+    4096,
+    NULL,
+    2,
+    NULL,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    taskMPU,
+    "MPU Task",
+    3072,
+    NULL,
+    1,
+    NULL,
+    0
+  );
+
+  Serial.println("Robot Ready - Aggressive Target Lock Mode");
+}
+
+// ======================================================
+// LOOP KOSONG
+// Semua logic jalan di RTOS task
+// ======================================================
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
